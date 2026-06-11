@@ -279,13 +279,10 @@ def _to_ddmmyyyy(value: str) -> str:
 def _to_ddmmyyyy_safe(value: str) -> str:
     if not value or str(value).strip() in ("", "None", "nan"):
         return ""
-    s = str(value).strip()
-    if s.lower().startswith("http"):
-        return ""
     try:
-        return datetime.strptime(s, "%Y-%m-%d").strftime("%d/%m/%Y")
+        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d/%m/%Y")
     except Exception:
-        return s
+        return str(value)
 
 
 def _slugify(value: str) -> str:
@@ -363,9 +360,6 @@ def _procesar_excels(drive_client, carpetas_validas: list) -> tuple[list, list]:
     for folder_id, excels in excels_por_carpeta.items():
         carpeta = carpetas_map[folder_id]
         for excel in excels:
-            # Archivos de infraestructura: ignorar silenciosamente sin reportar como inválidos
-            if excel["name"].lower() in ("template.xlsx", "template.txt"):
-                continue
             validacion = validar_nombre_excel(excel["name"])
             if not validacion["valido"]:
                 excels_invalidos.append(
@@ -461,9 +455,6 @@ def _procesar_excels_desde_dict(drive_client, excels_por_carpeta: dict, carpetas
         if not carpeta:
             continue
         for excel in excels:
-            # Archivos de infraestructura: ignorar silenciosamente sin reportar como inválidos
-            if excel["name"].lower() in ("template.xlsx", "template.txt"):
-                continue
             validacion = validar_nombre_excel(excel["name"])
             if not validacion["valido"]:
                 excels_invalidos.append({
@@ -933,15 +924,8 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
         # ── Filtros ──
         st.markdown("**Filtros**")
         fc1, fc2, fc3, fc4 = st.columns([2, 1.5, 1.5, 1.5])
-
-        # Selectbox de proveedores (reemplaza text_input para evitar errores de tipeo)
-        _proveedores_t3 = ["Todos"] + sorted(
-            df_fin["Proveedor"].dropna().astype(str).str.strip().unique().tolist()
-        )
-        filtro_prov = fc1.selectbox(
-            "Proveedor", options=_proveedores_t3, key="t3_fp",
-            label_visibility="collapsed"
-        )
+        filtro_prov = fc1.text_input("Proveedor", placeholder="Buscar…", key="t3_fp",
+                                      label_visibility="collapsed")
         filtro_res = fc2.selectbox("Resolución", ["Todas", "NOTA DE CREDITO", "CAMBIO", "RECHAZADO"],
                                     key="t3_fr", label_visibility="collapsed")
         filtro_desde = fc3.date_input("Desde resolución", value=None, format="DD/MM/YYYY",
@@ -950,12 +934,8 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
                                        key="t3_fh", label_visibility="collapsed")
 
         df_show = df_fin.copy()
-
-        # Proveedor específico seleccionado → mostrar todos sus registros
-        _filtro_prov_activo = filtro_prov != "Todos"
-        if _filtro_prov_activo:
-            df_show = df_show[df_show["Proveedor"].str.strip() == filtro_prov]
-
+        if filtro_prov.strip():
+            df_show = df_show[df_show["Proveedor"].str.contains(filtro_prov.strip(), case=False, na=False)]
         if filtro_res != "Todas":
             df_show = df_show[df_show["Resolucion"].str.strip() == filtro_res]
         if filtro_desde:
@@ -963,19 +943,9 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
         if filtro_hasta:
             df_show = df_show[df_show["Fecha_Resolucion"].str.strip() <= filtro_hasta.strftime("%Y-%m-%d")]
 
-        # Sin proveedor elegido: mostrar solo los últimos 3 casos
-        _modo_limitado = not _filtro_prov_activo
-        if _modo_limitado:
-            df_show_display = df_show.tail(3)
-        else:
-            df_show_display = df_show
+        st.caption(f"Total histórico: **{len(df_fin)}** | Mostrando: **{len(df_show)}**")
 
-        st.caption(
-            f"Total histórico: **{len(df_fin)}** | Mostrando: **{len(df_show_display)}**"
-            + (" — últimos 3. Elegí un proveedor para ver el historial completo." if _modo_limitado else "")
-        )
-
-        if df_show_display.empty:
+        if df_show.empty:
             st.info("No hay registros que coincidan con los filtros.")
         else:
             headers_t3 = [
@@ -988,7 +958,7 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
                 hc.markdown(f'<div class="tabla1-head-cell">{ht}</div>', unsafe_allow_html=True)
             st.markdown('<div class="tabla1-header-divider"></div>', unsafe_allow_html=True)
 
-            for idx, (_, row) in enumerate(df_show_display.iterrows()):
+            for idx, (_, row) in enumerate(df_show.iterrows()):
                 cols3 = st.columns(widths_t3)
                 cols3[0].write(str(row.get("Proveedor", "")))
                 cols3[1].write(_to_ddmmyyyy_safe(str(row.get("Fecha_carga", ""))))
@@ -1008,13 +978,13 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
 
         # ── Exportar a Excel ──
         st.markdown("---")
-        if not df_show_display.empty and st.button("📥 Exportar a Excel", key="t3_export"):
+        if not df_show.empty and st.button("📥 Exportar a Excel", key="t3_export"):
             export_cols = [
                 "Proveedor", "Fecha_carga", "Fecha_Envio", "Numero_Envio",
                 "Numero_Caso_RMA", "Resolucion", "Detalle_Resolucion",
                 "Fecha_Resolucion", "Links_Adjuntos",
             ]
-            df_exp = df_show_display[[c for c in export_cols if c in df_show_display.columns]].copy()
+            df_exp = df_show[[c for c in export_cols if c in df_show.columns]].copy()
             for c in ("Fecha_carga", "Fecha_Envio", "Fecha_Resolucion"):
                 if c in df_exp.columns:
                     df_exp[c] = df_exp[c].apply(_to_ddmmyyyy_safe)
