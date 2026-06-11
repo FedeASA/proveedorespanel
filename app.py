@@ -277,12 +277,17 @@ def _to_ddmmyyyy(value: str) -> str:
 
 
 def _to_ddmmyyyy_safe(value: str) -> str:
+    """Convierte YYYY-MM-DD → DD/MM/YYYY.  Rechaza URLs y cualquier valor no-fecha."""
     if not value or str(value).strip() in ("", "None", "nan"):
         return ""
+    s = str(value).strip()
+    # Rechazar explícitamente URLs o cadenas que no luzcan como fecha ISO
+    if s.startswith("http") or not re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        return ""
     try:
-        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d/%m/%Y")
+        return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
     except Exception:
-        return str(value)
+        return ""
 
 
 def _slugify(value: str) -> str:
@@ -360,6 +365,9 @@ def _procesar_excels(drive_client, carpetas_validas: list) -> tuple[list, list]:
     for folder_id, excels in excels_por_carpeta.items():
         carpeta = carpetas_map[folder_id]
         for excel in excels:
+            # Archivos operativos del sistema — se ignoran silenciosamente
+            if excel["name"].lower() in ("template.xlsx", "template.txt"):
+                continue
             validacion = validar_nombre_excel(excel["name"])
             if not validacion["valido"]:
                 excels_invalidos.append(
@@ -455,6 +463,9 @@ def _procesar_excels_desde_dict(drive_client, excels_por_carpeta: dict, carpetas
         if not carpeta:
             continue
         for excel in excels:
+            # Archivos operativos del sistema — se ignoran silenciosamente
+            if excel["name"].lower() in ("template.xlsx", "template.txt"):
+                continue
             validacion = validar_nombre_excel(excel["name"])
             if not validacion["valido"]:
                 excels_invalidos.append({
@@ -921,11 +932,30 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
     df_fin = leer_registros(estado="FINALIZADO", sheet_id=SHEET_ID)
 
     if not df_fin.empty:
+        # ── Ordenar por Fecha_Resolucion desc (robustamente: URLs/vacíos al final) ──
+        def _sort_key_fecha(v: str) -> str:
+            s = str(v).strip()
+            return s if (s and not s.startswith("http") and re.match(r"^\d{4}-\d{2}-\d{2}", s)) else ""
+
+        df_fin_sorted = df_fin.copy()
+        df_fin_sorted["_sk"] = df_fin_sorted["Fecha_Resolucion"].apply(_sort_key_fecha)
+        df_fin_sorted = df_fin_sorted.sort_values("_sk", ascending=False).drop(columns=["_sk"])
+
         # ── Filtros ──
         st.markdown("**Filtros**")
         fc1, fc2, fc3, fc4 = st.columns([2, 1.5, 1.5, 1.5])
-        filtro_prov = fc1.text_input("Proveedor", placeholder="Buscar…", key="t3_fp",
-                                      label_visibility="collapsed")
+
+        # Dropdown de proveedores (evita errores de tipeo)
+        proveedores_t3 = sorted(
+            df_fin_sorted["Proveedor"].str.strip()
+            .replace("", pd.NA).dropna().unique().tolist()
+        )
+        filtro_prov = fc1.selectbox(
+            "Proveedor",
+            options=["— Todos (últimos 3) —"] + proveedores_t3,
+            key="t3_fp",
+            label_visibility="collapsed",
+        )
         filtro_res = fc2.selectbox("Resolución", ["Todas", "NOTA DE CREDITO", "CAMBIO", "RECHAZADO"],
                                     key="t3_fr", label_visibility="collapsed")
         filtro_desde = fc3.date_input("Desde resolución", value=None, format="DD/MM/YYYY",
@@ -933,9 +963,11 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
         filtro_hasta = fc4.date_input("Hasta resolución", value=None, format="DD/MM/YYYY",
                                        key="t3_fh", label_visibility="collapsed")
 
-        df_show = df_fin.copy()
-        if filtro_prov.strip():
-            df_show = df_show[df_show["Proveedor"].str.contains(filtro_prov.strip(), case=False, na=False)]
+        df_show = df_fin_sorted.copy()
+        prov_activo = filtro_prov != "— Todos (últimos 3) —"
+
+        if prov_activo:
+            df_show = df_show[df_show["Proveedor"].str.strip() == filtro_prov]
         if filtro_res != "Todas":
             df_show = df_show[df_show["Resolucion"].str.strip() == filtro_res]
         if filtro_desde:
@@ -943,7 +975,17 @@ with st.expander("3. FINALIZADOS (HISTÓRICO)", expanded=True):
         if filtro_hasta:
             df_show = df_show[df_show["Fecha_Resolucion"].str.strip() <= filtro_hasta.strftime("%Y-%m-%d")]
 
-        st.caption(f"Total histórico: **{len(df_fin)}** | Mostrando: **{len(df_show)}**")
+        # Sin filtro activo → mostrar solo los últimos 3
+        hay_filtro = prov_activo or filtro_res != "Todas" or filtro_desde or filtro_hasta
+        if not hay_filtro:
+            df_show = df_show.head(3)
+            st.caption(
+                f"Total histórico: **{len(df_fin)}** | "
+                f"Mostrando: **últimos {len(df_show)}** — "
+                f"seleccioná un proveedor para ver el historial completo"
+            )
+        else:
+            st.caption(f"Total histórico: **{len(df_fin)}** | Mostrando: **{len(df_show)}**")
 
         if df_show.empty:
             st.info("No hay registros que coincidan con los filtros.")
@@ -1169,332 +1211,297 @@ def _generar_excels_con_template(
 
     return resultados
 
+
+# ══════════════════════════════════════════════════════════
+#  PANEL DE PRODUCTOS: RMA ALTAVISTA
+# ══════════════════════════════════════════════════════════
+
+with st.expander("PRODUCTOS – RMA ALTAVISTA", expanded=False):
+
+    st.markdown(
+        f"Este panel carga los datos de la hoja '{PRODUCTOS_SHEET_NAME}' en el spreadsheet de Google Sheets "
+        "y muestra los productos en una tabla clásica y ordenada."
+    )
+
+    col_p1, col_p2 = st.columns([3, 1])
+    if col_p2.button("🔄 Actualizar panel", use_container_width=True, key="panel_refresh"):
+        leer_ultimo_panel.clear()
+        st.rerun()
+
+    panel_title, df_panel = leer_ultimo_panel(SHEET_ID, PRODUCTOS_SHEET_NAME)
+    if df_panel.empty:
+        st.info(
+            f"No se encontraron registros en la hoja '{PRODUCTOS_SHEET_NAME}' de Google Sheets "
+            f"({panel_title})."
+        )
+    else:
+        st.caption(f"Pestaña leída: **{panel_title}** | Filas: **{len(df_panel)}**")
+        st.dataframe(df_panel, use_container_width=True, hide_index=True)
+
+        buf_panel = io.BytesIO()
+        with pd.ExcelWriter(buf_panel, engine="xlsxwriter") as writer:
+            df_panel.to_excel(writer, index=False, sheet_name=panel_title[:31])
+        buf_panel.seek(0)
+
+        col_p1.download_button(
+            label="📥 Exportar último panel a Excel",
+            data=buf_panel.getvalue(),
+            file_name=f"Panel_{panel_title.replace(' ', '_')}_{date.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
 # ══════════════════════════════════════════════════════════
 #  HERRAMIENTA: VERIFICAR PRODUCTOS PARA GARANTÍA (Google Sheets)
 # ══════════════════════════════════════════════════════════
-
-# Funciones robustas de lectura y escritura directas para evitar fallos de formato
-@st.cache_data(ttl=60, show_spinner=False)
-def _obtener_datos_garantia_robusto(sheet_id: str, ws_name: str):
-    """
-    Lee todos los valores como texto para evitar inconsistencias con booleanos/checkboxes.
-    Identifica las columnas sin importar mayúsculas/minúsculas.
-    """
-    _, gc = get_google_clients()
-    sh = gc.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet(ws_name)
-        data = ws.get_all_values()
-    except Exception:
-        return [], []
-
-    if not data or len(data) < 2:
-        return [], []
-
-    headers = [str(h).strip().lower() for h in data[0]]
-    
-    # Obtener índices independientemente de cómo estén escritos en Sheets
-    idx_prov = next((i for i, h in enumerate(headers) if 'proveedor' in h), -1)
-    idx_prod = next((i for i, h in enumerate(headers) if 'producto' in h), -1)
-    idx_ser  = next((i for i, h in enumerate(headers) if 'serial' in h), -1)
-    idx_diag = next((i for i, h in enumerate(headers) if 'diagnostico' in h or 'diagnóstico' in h), -1)
-    idx_cap  = next((i for i, h in enumerate(headers) if 'rma_capturado' in h), -1)
-
-    if idx_prov == -1 or idx_cap == -1:
-        return [], []  # Faltan columnas vitales
-
-    proveedores_unicos = set()
-    registros_pendientes = []
-
-    for i, row in enumerate(data[1:], start=2): # +2 porque data[0] son headers y Sheets empieza en fila 1
-        prov = row[idx_prov].strip() if idx_prov < len(row) else ""
-        cap = row[idx_cap].strip().upper() if idx_cap < len(row) else ""
-
-        # Checkbox evaluado de forma segura (ignora "FALSE", "", "0")
-        is_capturado = cap in ("TRUE", "1", "VERDADERO")
-
-        if prov and not is_capturado:
-            proveedores_unicos.add(prov)
-            registros_pendientes.append({
-                "_row": i,
-                "proveedor": prov,
-                "Producto": row[idx_prod].strip() if idx_prod != -1 and idx_prod < len(row) else "",
-                "Serial": row[idx_ser].strip() if idx_ser != -1 and idx_ser < len(row) else "",
-                "diagnostico": row[idx_diag].strip() if idx_diag != -1 and idx_diag < len(row) else "",
-                "RMA_Capturado": cap
-            })
-
-    return sorted(list(proveedores_unicos)), registros_pendientes
-
-
-def _marcar_capturados_robusto(sheet_id: str, ws_name: str, row_numbers: list):
-    """Escribe TRUE en RMA_Capturado y la fecha ISO en RMA_Fecha_Captura"""
-    from gspread.utils import rowcol_to_a1
-    from datetime import date
-
-    _, gc = get_google_clients()
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(ws_name)
-    headers = [str(h).strip().lower() for h in ws.row_values(1)]
-
-    try:
-        col_cap = headers.index("rma_capturado") + 1
-    except ValueError:
-        return 0, ["No se encontró la columna RMA_Capturado en la hoja."]
-
-    # Buscar columna de fecha, si no existe no la rompe, simplemente no la actualiza
-    try:
-        col_fecha = headers.index("rma_fecha_captura") + 1
-    except ValueError:
-        col_fecha = None
-
-    updates = []
-    hoy_iso = date.today().isoformat()  # Formato YYYY-MM-DD
-
-    for row in row_numbers:
-        updates.append({"range": rowcol_to_a1(row, col_cap), "values": [["TRUE"]]})
-        if col_fecha:
-            updates.append({"range": rowcol_to_a1(row, col_fecha), "values": [[hoy_iso]]})
-
-    if updates:
-        ws.batch_update(updates)
-
-    return len(row_numbers), []
-
 
 with st.expander("🔍 VERIFICAR PRODUCTOS PARA GARANTÍA", expanded=False):
 
     st.markdown(
         "Consultá la hoja **RMA ALTAVISTA** para encontrar productos pendientes de garantía "
         "de un proveedor y generá el Excel de remisión. Al confirmar, los registros quedan "
-        "marcados como capturados y se registra la fecha."
+        "marcados como capturados (`RMA_Capturado = TRUE`)."
     )
 
     col_at1, _ = st.columns([2, 6])
     with col_at1:
         if st.button("🔄 Actualizar lista de proveedores", use_container_width=True, key="at_ref_prov"):
-            _obtener_datos_garantia_robusto.clear()
+            leer_productos_garantia.clear()
             st.rerun()
 
-    # Ejecutar la lectura robusta
-    lista_proveedores_at, todos_los_pendientes = _obtener_datos_garantia_robusto(SHEET_ID, PRODUCTOS_SHEET_NAME)
+    lista_proveedores_at = listar_proveedores_garantia(SHEET_ID)
 
     if not lista_proveedores_at:
         st.warning(
-            f"No se encontraron proveedores con registros pendientes en '{PRODUCTOS_SHEET_NAME}'. "
+            "No se encontraron proveedores con registros pendientes en 'RMA ALTAVISTA'. "
             "Verificá que la hoja exista y tenga las columnas: "
-            "Proveedor, Producto, Serial, Diagnostico, RMA_Capturado."
+            "proveedor, Producto, Serial, diagnostico, RMA_Capturado."
         )
     else:
         proveedor_sel = st.selectbox(
-            "Seleccioná un proveedor:",
+            "Selecioná un proveedor:",
             options=["— Elegir —"] + lista_proveedores_at,
             key="at_prov_sel",
         )
 
         if proveedor_sel and proveedor_sel != "— Elegir —":
-            # Filtrar los registros en memoria para el proveedor seleccionado
-            registros_at = [r for r in todos_los_pendientes if r["proveedor"].lower() == proveedor_sel.lower()]
 
-            if not registros_at:
-                st.info(f"No hay productos pendientes de captura para «{proveedor_sel}».")
-            else:
-                st.success(
-                    f"Se encontraron **{len(registros_at)}** producto(s) pendiente(s) "
-                    f"para «{proveedor_sel}»."
-                )
+            if st.button(
+                f"🔎 Buscar productos pendientes de «f{proveedor_sel}»",
+                key="at_buscar",
+            ):
+                with st.spinner("Consultando hoja RMA ALTAVISTA…"):
+                    registros_at = obtener_registros_proveedor_sheets(SHEET_ID, proveedor_sel)
+                    st.session_state["_at_registros"] = registros_at
+                    st.session_state["_at_proveedor"] = proveedor_sel
 
-                df_at = pd.DataFrame(registros_at)[["Producto", "Serial", "diagnostico"]]
-                st.dataframe(df_at, use_container_width=True, hide_index=True)
+            if (
+                "_at_registros" in st.session_state
+                and st.session_state.get("_at_proveedor") == proveedor_sel
+            ):
+                registros_at = st.session_state["_at_registros"]
 
-                def _generar_excel_garantia(registros: list, proveedor: str) -> bytes:
-                    from openpyxl import Workbook
-                    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-                    from openpyxl.utils import get_column_letter
-
-                    wb = Workbook()
-                    ws_xl = wb.active
-                    ws_xl.title = "Garantia"
-
-                    COLOR_HDR_BG = "1F4E79"
-                    COLOR_HDR_FG = "FFFFFF"
-                    COLOR_ALT    = "D6E4F0"
-
-                    thin = Side(style="thin", color="AAAAAA")
-                    brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-                    # Título
-                    ws_xl.merge_cells("A1:C1")
-                    c = ws_xl["A1"]
-                    c.value = f"Verificación de Garantía — {proveedor}"
-                    c.font  = Font(name="Arial", bold=True, size=13, color=COLOR_HDR_FG)
-                    c.fill  = PatternFill("solid", start_color=COLOR_HDR_BG)
-                    c.alignment = Alignment(horizontal="center", vertical="center")
-                    ws_xl.row_dimensions[1].height = 26
-
-                    # Fecha
-                    ws_xl.merge_cells("A2:C2")
-                    c2_xl = ws_xl["A2"]
-                    c2_xl.value = f"Generado: {date.today().strftime('%d/%m/%Y')}"
-                    c2_xl.font  = Font(name="Arial", size=9, italic=True, color="555555")
-                    c2_xl.alignment = Alignment(horizontal="center")
-
-                    # Encabezados
-                    for ci, enc in enumerate(["Producto", "Serial", "Diagnóstico"], 1):
-                        c = ws_xl.cell(row=4, column=ci, value=enc)
-                        c.font  = Font(name="Arial", bold=True, size=11, color=COLOR_HDR_FG)
-                        c.fill  = PatternFill("solid", start_color=COLOR_HDR_BG)
-                        c.alignment = Alignment(horizontal="center", vertical="center")
-                        c.border = brd
-                    ws_xl.row_dimensions[4].height = 20
-
-                    # Datos
-                    for i, rec in enumerate(registros, start=5):
-                        fill = PatternFill("solid", start_color=COLOR_ALT) if i % 2 == 0 else None
-                        for ci, campo in enumerate(["Producto", "Serial", "diagnostico"], 1):
-                            c = ws_xl.cell(row=i, column=ci, value=rec.get(campo, ""))
-                            c.font = Font(name="Arial", size=10)
-                            c.alignment = Alignment(vertical="center", wrap_text=True)
-                            c.border = brd
-                            if fill:
-                                c.fill = fill
-                        ws_xl.row_dimensions[i].height = 16
-
-                    # Total
-                    ft = len(registros) + 5
-                    ws_xl.merge_cells(f"A{ft}:B{ft}")
-                    ws_xl.cell(row=ft, column=1, value="Total productos").font = Font(name="Arial", bold=True, size=10)
-                    ws_xl.cell(row=ft, column=1).alignment = Alignment(horizontal="right")
-                    ws_xl.cell(row=ft, column=3, value=len(registros)).font = Font(name="Arial", bold=True, size=10)
-                    ws_xl.cell(row=ft, column=3).alignment = Alignment(horizontal="center")
-
-                    for ci, ancho in enumerate([45, 22, 50], 1):
-                        ws_xl.column_dimensions[get_column_letter(ci)].width = ancho
-
-                    buf = io.BytesIO()
-                    wb.save(buf)
-                    return buf.getvalue()
-
-                # ── Intentar template desde Drive ────────────────────────
-                _folder_id_prov = _buscar_carpeta_proveedor(proveedor_sel)
-                _tmpl_info = (
-                    _buscar_template_en_carpeta_cache(_folder_id_prov)
-                    if _folder_id_prov
-                    else {"xlsx_id": None, "txt_id": None}
-                )
-                _usa_template = bool(
-                    _tmpl_info.get("xlsx_id") and _tmpl_info.get("txt_id")
-                )
-                archivos_excel_descarga = []
-
-                if _usa_template:
-                    with st.spinner("Cargando template desde Drive…"):
-                        _tmpl_xlsx_b = _descargar_bytes_drive(_tmpl_info["xlsx_id"])
-                        _tmpl_txt_b  = _descargar_bytes_drive(_tmpl_info["txt_id"])
-                        _tmpl_cfg = (
-                            _parsear_template_txt(
-                                _tmpl_txt_b.decode("utf-8", errors="replace")
-                            )
-                            if _tmpl_txt_b else None
-                        )
-                    if _tmpl_xlsx_b and _tmpl_cfg:
-                        archivos_excel_descarga = _generar_excels_con_template(
-                            _tmpl_xlsx_b, _tmpl_cfg, registros_at, proveedor_sel
-                        )
-                        n_arch = len(archivos_excel_descarga)
-                        cap    = _tmpl_cfg["capacidad"]
-                        st.info(
-                            f"📋 Template del proveedor encontrado — "
-                            f"capacidad: **{cap}** artículos/planilla."
-                            + (f" Se generarán **{n_arch}** archivos." if n_arch > 1 else "")
-                        )
-                    else:
-                        st.warning(
-                            "⚠️ Template encontrado en Drive pero no pudo procesarse. "
-                            "Se usará el formato genérico."
-                        )
-
-                if not archivos_excel_descarga:
-                    archivos_excel_descarga = [
-                        (
-                            f"Garantia_{proveedor_sel.replace(' ', '_')}"
-                            f"_{date.today().strftime('%Y%m%d')}.xlsx",
-                            _generar_excel_garantia(registros_at, proveedor_sel),
-                        )
-                    ]
-
-                # ── Descarga y confirmación ──────────────────────────────
-                st.markdown("---")
-                st.markdown("**¿Qué querés hacer con estos registros?**")
-                col_dl, col_conf, _ = st.columns([1.5, 2, 4.5])
-
-                if len(archivos_excel_descarga) == 1:
-                    _nombre_dl, _bytes_dl = archivos_excel_descarga[0]
-                    col_dl.download_button(
-                        label="⬇️ Descargar Excel",
-                        data=_bytes_dl,
-                        file_name=_nombre_dl,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="at_dl",
-                        use_container_width=True,
+                if not registros_at:
+                    st.info(
+                        f"No hay productos pendientes de captura para «f{proveedor_sel}»."
                     )
                 else:
-                    import zipfile as _zipfile
-                    _zip_buf = io.BytesIO()
-                    with _zipfile.ZipFile(_zip_buf, "w", _zipfile.ZIP_DEFLATED) as _zf:
-                        for _nf, _bf in archivos_excel_descarga:
-                            _zf.writestr(_nf, _bf)
-                    _zip_name = (
-                        f"Garantia_{proveedor_sel.replace(' ', '_')}"
-                        f"_{date.today().strftime('%Y%m%d')}.zip"
+                    st.success(
+                        f"Se encontraron **{len(registros_at)}** producto(s) pendiente(s) "
+                        f"para «f{proveedor_sel}»."
                     )
-                    col_dl.download_button(
-                        label=f"⬇️ Descargar ZIP ({len(archivos_excel_descarga)} archivos)",
-                        data=_zip_buf.getvalue(),
-                        file_name=_zip_name,
-                        mime="application/zip",
-                        key="at_dl_zip",
-                        use_container_width=True,
+
+                    df_at = pd.DataFrame(registros_at)[["Producto", "Serial", "diagnostico"]]
+                    st.dataframe(df_at, use_container_width=True, hide_index=True)
+
+                    def _generar_excel_garantia(registros: list, proveedor: str) -> bytes:
+                        from openpyxl import Workbook
+                        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                        from openpyxl.utils import get_column_letter
+
+                        wb = Workbook()
+                        ws_xl = wb.active
+                        ws_xl.title = "Garantia"
+
+                        COLOR_HDR_BG = "1F4E79"
+                        COLOR_HDR_FG = "FFFFFF"
+                        COLOR_ALT    = "D6E4F0"
+
+                        thin = Side(style="thin", color="AAAAAA")
+                        brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+                        # Título
+                        ws_xl.merge_cells("A1:C1")
+                        c = ws_xl["A1"]
+                        c.value = f"Verificación de Garantía — {proveedor}"
+                        c.font  = Font(name="Arial", bold=True, size=13, color=COLOR_HDR_FG)
+                        c.fill  = PatternFill("solid", start_color=COLOR_HDR_BG)
+                        c.alignment = Alignment(horizontal="center", vertical="center")
+                        ws_xl.row_dimensions[1].height = 26
+
+                        # Fecha
+                        ws_xl.merge_cells("A2:C2")
+                        c2_xl = ws_xl["A2"]
+                        c2_xl.value = f"Generado: {date.today().strftime('%d/%m/%Y')}"
+                        c2_xl.font  = Font(name="Arial", size=9, italic=True, color="555555")
+                        c2_xl.alignment = Alignment(horizontal="center")
+
+                        # Encabezados
+                        for ci, enc in enumerate(["Producto", "Serial", "Diagnóstico"], 1):
+                            c = ws_xl.cell(row=4, column=ci, value=enc)
+                            c.font  = Font(name="Arial", bold=True, size=11, color=COLOR_HDR_FG)
+                            c.fill  = PatternFill("solid", start_color=COLOR_HDR_BG)
+                            c.alignment = Alignment(horizontal="center", vertical="center")
+                            c.border = brd
+                        ws_xl.row_dimensions[4].height = 20
+
+                        # Datos
+                        for i, rec in enumerate(registros, start=5):
+                            fill = PatternFill("solid", start_color=COLOR_ALT) if i % 2 == 0 else None
+                            for ci, campo in enumerate(["Producto", "Serial", "diagnostico"], 1):
+                                c = ws_xl.cell(row=i, column=ci, value=rec.get(campo, ""))
+                                c.font = Font(name="Arial", size=10)
+                                c.alignment = Alignment(vertical="center", wrap_text=True)
+                                c.border = brd
+                                if fill:
+                                    c.fill = fill
+                            ws_xl.row_dimensions[i].height = 16
+
+                        # Total
+                        ft = len(registros) + 5
+                        ws_xl.merge_cells(f"A{ft}:B{ft}")
+                        ws_xl.cell(row=ft, column=1, value="Total productos").font = Font(name="Arial", bold=True, size=10)
+                        ws_xl.cell(row=ft, column=1).alignment = Alignment(horizontal="right")
+                        ws_xl.cell(row=ft, column=3, value=len(registros)).font = Font(name="Arial", bold=True, size=10)
+                        ws_xl.cell(row=ft, column=3).alignment = Alignment(horizontal="center")
+
+                        for ci, ancho in enumerate([45, 22, 50], 1):
+                            ws_xl.column_dimensions[get_column_letter(ci)].width = ancho
+
+                        buf = io.BytesIO()
+                        wb.save(buf)
+                        return buf.getvalue()
+
+                    # ── Intentar template desde Drive ────────────────────────
+                    _folder_id_prov = _buscar_carpeta_proveedor(proveedor_sel)
+                    _tmpl_info = (
+                        _buscar_template_en_carpeta_cache(_folder_id_prov)
+                        if _folder_id_prov
+                        else {"xlsx_id": None, "txt_id": None}
                     )
-                    with st.expander(
-                        f"📂 Descargar archivos individuales "
-                        f"({len(archivos_excel_descarga)})",
-                        expanded=False,
-                    ):
-                        for _i, (_nf, _bf) in enumerate(archivos_excel_descarga):
-                            st.download_button(
-                                label=f"⬇️ {_nf}",
-                                data=_bf,
-                                file_name=_nf,
-                                mime=(
-                                    "application/vnd.openxmlformats-officedocument"
-                                    ".spreadsheetml.sheet"
-                                ),
-                                key=f"at_dl_ind_{_i}",
-                                use_container_width=True,
+                    _usa_template = bool(
+                        _tmpl_info.get("xlsx_id") and _tmpl_info.get("txt_id")
+                    )
+                    archivos_excel_descarga = []
+
+                    if _usa_template:
+                        with st.spinner("Cargando template desde Drive…"):
+                            _tmpl_xlsx_b = _descargar_bytes_drive(_tmpl_info["xlsx_id"])
+                            _tmpl_txt_b  = _descargar_bytes_drive(_tmpl_info["txt_id"])
+                            _tmpl_cfg = (
+                                _parsear_template_txt(
+                                    _tmpl_txt_b.decode("utf-8", errors="replace")
+                                )
+                                if _tmpl_txt_b else None
+                            )
+                        if _tmpl_xlsx_b and _tmpl_cfg:
+                            archivos_excel_descarga = _generar_excels_con_template(
+                                _tmpl_xlsx_b, _tmpl_cfg, registros_at, proveedor_sel
+                            )
+                            n_arch = len(archivos_excel_descarga)
+                            cap    = _tmpl_cfg["capacidad"]
+                            st.info(
+                                f"📋 Template del proveedor encontrado — "
+                                f"capacidad: **{cap}** artículos/planilla."
+                                + (f" Se generarán **{n_arch}** archivos." if n_arch > 1 else "")
+                            )
+                        else:
+                            st.warning(
+                                "⚠️ Template encontrado en Drive pero no pudo procesarse. "
+                                "Se usará el formato genérico."
                             )
 
-                if col_conf.button(
-                    "✅ Confirmar y marcar como capturados",
-                    key="at_confirmar",
-                    use_container_width=True,
-                    type="primary",
-                ):
-                    row_numbers = [r["_row"] for r in registros_at]
-                    with st.spinner(f"Marcando {len(row_numbers)} registros en Google Sheets…"):
-                        cant, errores = _marcar_capturados_robusto(SHEET_ID, PRODUCTOS_SHEET_NAME, row_numbers)
+                    if not archivos_excel_descarga:
+                        archivos_excel_descarga = [
+                            (
+                                f"Garantia_{proveedor_sel.replace(' ', '_')}"
+                                f"_{date.today().strftime('%Y%m%d')}.xlsx",
+                                _generar_excel_garantia(registros_at, proveedor_sel),
+                            )
+                        ]
 
-                    if errores:
-                        st.warning(
-                            f"Se actualizaron {cant} registro(s) pero hubo "
-                            f"{len(errores)} error(es): {'; '.join(errores[:3])}"
+                    # ── Descarga y confirmación ──────────────────────────────
+                    st.markdown("---")
+                    st.markdown("**¿Qué querés hacer con estos registros?**")
+                    col_dl, col_conf, _ = st.columns([1.5, 2, 4.5])
+
+                    if len(archivos_excel_descarga) == 1:
+                        _nombre_dl, _bytes_dl = archivos_excel_descarga[0]
+                        col_dl.download_button(
+                            label="⬇️ Descargar Excel",
+                            data=_bytes_dl,
+                            file_name=_nombre_dl,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="at_dl",
+                            use_container_width=True,
                         )
                     else:
-                        st.success(
-                            f"✅ {cant} registro(s) marcados como capturados en Google Sheets. "
-                            "No aparecerán en futuras consultas."
+                        import zipfile as _zipfile
+                        _zip_buf = io.BytesIO()
+                        with _zipfile.ZipFile(_zip_buf, "w", _zipfile.ZIP_DEFLATED) as _zf:
+                            for _nf, _bf in archivos_excel_descarga:
+                                _zf.writestr(_nf, _bf)
+                        _zip_name = (
+                            f"Garantia_{proveedor_sel.replace(' ', '_')}"
+                            f"_{date.today().strftime('%Y%m%d')}.zip"
                         )
-                    
-                    # Refrescar estado para vaciar la lista
-                    _obtener_datos_garantia_robusto.clear()
-                    st.rerun()
+                        col_dl.download_button(
+                            label=f"⬇️ Descargar ZIP ({len(archivos_excel_descarga)} archivos)",
+                            data=_zip_buf.getvalue(),
+                            file_name=_zip_name,
+                            mime="application/zip",
+                            key="at_dl_zip",
+                            use_container_width=True,
+                        )
+                        with st.expander(
+                            f"📂 Descargar archivos individuales "
+                            f"({len(archivos_excel_descarga)})",
+                            expanded=False,
+                        ):
+                            for _i, (_nf, _bf) in enumerate(archivos_excel_descarga):
+                                st.download_button(
+                                    label=f"⬇️ {_nf}",
+                                    data=_bf,
+                                    file_name=_nf,
+                                    mime=(
+                                        "application/vnd.openxmlformats-officedocument"
+                                        ".spreadsheetml.sheet"
+                                    ),
+                                    key=f"at_dl_ind_{_i}",
+                                    use_container_width=True,
+                                )
+
+                    if col_conf.button(
+                        "✅ Confirmar y marcar como capturados",
+                        key="at_confirmar",
+                        use_container_width=True,
+                        type="primary",
+                    ):
+                        row_numbers = [r["_row"] for r in registros_at]
+                        with st.spinner(f"Marcando {len(row_numbers)} registros en Google Sheets…"):
+                            cant, errores = marcar_capturados_sheets(SHEET_ID, row_numbers)
+
+                        if errores:
+                            st.warning(
+                                f"Se actualizaron {cant} registro(s) pero hubo "
+                                f"{len(errores)} error(es): {'; '.join(errores[:3])}"
+                            )
+                        else:
+                            st.success(
+                                f"✅ {cant} registro(s) marcados como capturados en Google Sheets. "
+                                "No aparecerán en futuras consultas."
+                            )
+                        st.session_state.pop("_at_registros", None)
+                        st.session_state.pop("_at_proveedor", None)
+                        leer_productos_garantia.clear()
+                        st.rerun()
