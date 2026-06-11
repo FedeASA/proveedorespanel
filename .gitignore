@@ -1,0 +1,46 @@
+<<<<<<< HEAD
+# Archivos de credenciales y claves privadas
+creds_google.json
+*.json
+*.toml
+
+# Carpeta local de secretos de Streamlit (No subir a Git)
+.streamlit/
+
+# Entornos virtuales de Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+=======
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit / secrets
+.streamlit/secrets.toml
+creds_google.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+>>>>>>> a423f20 (update de archivos base para el proyecto de garantia, se agregan archivos nuevos y se eliminan algunos que ya no se necesitan)
